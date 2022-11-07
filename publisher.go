@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 	"go.uber.org/zap"
@@ -11,11 +12,36 @@ import (
 
 type Dispatch struct {
 	retries    int
+	startTime  time.Time
 	exchange   string
 	routingKey string
 	mandatory  bool
 	immediate  bool
-	publishing amqp.Publishing
+	Publishing amqp.Publishing
+}
+
+func (d *Dispatch) GetRetries() int {
+	return d.retries
+}
+
+func (d *Dispatch) GetStartTime() time.Time {
+	return d.startTime
+}
+
+func (d *Dispatch) GetExchange() string {
+	return d.exchange
+}
+
+func (d *Dispatch) GetRoutingKey() string {
+	return d.routingKey
+}
+
+func (d *Dispatch) IsMandatory() bool {
+	return d.mandatory
+}
+
+func (d *Dispatch) IsImmediate() bool {
+	return d.immediate
 }
 
 type PublisherOptions struct {
@@ -42,14 +68,21 @@ type PublisherContext struct {
 
 	publishTkn chan bool // Channel to acquire publishing rights for a thread
 
-	dispatchBuff chan Dispatch // Buffered Dispatch channel
-	dispatchMtx  *sync.RWMutex //
-	dispatchWg   *sync.WaitGroup
-	handlerWg    *sync.WaitGroup
+	dispatchBuff chan Dispatch   // Buffered Dispatch channel
+	dispatchMtx  *sync.RWMutex   // Locks dispatching to not proceed out of sync
+	dispatchWg   *sync.WaitGroup // Total pending dispatches
+	handlerWg    *sync.WaitGroup // Wait group of handler routines
+	processWg    *sync.WaitGroup // Wait group of the dispatch processing routine
 
-	pending    map[uint64]Dispatch
-	pendingMtx sync.Mutex
-	maxRetries int
+	pending    map[uint64]Dispatch // Map of pending dispatches
+	pendingMtx sync.Mutex          // Lock keeping the pending map synchronized
+	maxRetries int                 // Maimum retries of dispatches
+
+	blocking    map[string](chan error) // Map of blocked dispatch channels
+	blockingMtx *sync.Mutex             // Lock to keep access to blocking map in sync
+
+	BeforePublish func(context.Context, *Dispatch) // Hook executing code before publishing a dispatch
+	AfterConfirm  func(Dispatch, bool)             // Hook executing after confirming a dispatch
 
 	logger *zap.Logger
 }
@@ -89,20 +122,24 @@ func newPublisherContext(
 		dispatchMtx:  &sync.RWMutex{},
 		dispatchWg:   &sync.WaitGroup{},
 		handlerWg:    &sync.WaitGroup{},
+		processWg:    &sync.WaitGroup{},
 
 		pending:    map[uint64]Dispatch{},
 		pendingMtx: sync.Mutex{},
 		maxRetries: options.MaxRetries,
 
+		blocking:    map[string](chan error){},
+		blockingMtx: &sync.Mutex{},
+
 		logger: lgr,
 	}
 
-	pub.handlerWg.Add(1)
+	pub.processWg.Add(1)
 	go func() {
-		defer pub.handlerWg.Done()
+		defer pub.processWg.Done()
 		pub.logger.Info("started processing dispatches")
 		defer pub.logger.Info("stopped processing dispatches")
-		pub.dispatchHandler()
+		pub.dispatchProcessor()
 	}()
 
 	pub.publishTkn <- true
@@ -156,7 +193,7 @@ func (pub *PublisherContext) initialize(
 // Processes dispatches by publishing them. If a publishing succeeded, the
 // dispatch is put into the pending map awaiting confirmation. If the publishin
 // failed, then it is retried
-func (pub *PublisherContext) dispatchHandler() {
+func (pub *PublisherContext) dispatchProcessor() {
 	var dsp Dispatch
 	for active := true; active; {
 		if dsp, active = <-pub.dispatchBuff; active {
@@ -165,16 +202,12 @@ func (pub *PublisherContext) dispatchHandler() {
 				dsp.routingKey,
 				dsp.mandatory,
 				dsp.immediate,
-				dsp.publishing,
+				dsp.Publishing,
 			)
 			if err != nil {
 				pub.retryDispatch(dsp)
 			} else {
-				if dsp, ok := pub.pending[seq]; !ok {
-					pub.pending[seq] = dsp
-				} else {
-					pub.setPending(seq, dsp)
-				}
+				pub.setPending(seq, dsp)
 			}
 		}
 	}
@@ -188,9 +221,10 @@ func (pub *PublisherContext) retryDispatch(dsp Dispatch) {
 	if dsp.retries < pub.maxRetries {
 		pub.dispatchBuff <- dsp
 	} else {
-		pub.logger.Error(
-			"failed to retry dispatch",
-			zap.Any("dispatch", dsp),
+		pub.logger.Error("failed to retry dispatch", zap.Any("dispatch", dsp))
+		pub.clearBlocking(
+			dsp.Publishing.MessageId,
+			fmt.Errorf("failed after max retries"),
 		)
 	}
 }
@@ -235,6 +269,32 @@ func (pub *PublisherContext) clearPending(seq uint64) {
 	}
 }
 
+// Creates a channel for a blocking dispatch operation using a specific unique key
+func (pub *PublisherContext) setBlocking(key string) (chan error, error) {
+	pub.blockingMtx.Lock()
+	defer pub.blockingMtx.Unlock()
+	if ch := pub.blocking[key]; ch != nil {
+		return nil, fmt.Errorf("key already exists")
+	}
+	ch := make(chan error, 1)
+	pub.blocking[key] = ch
+	return ch, nil
+}
+
+// Clears the channel for a blocking dispatch operation with a specific unique key.
+// If the operation failed, it sends an error on the channel first. If the key is
+// not found in the map, nothing happens
+func (pub *PublisherContext) clearBlocking(key string, err error) {
+	pub.blockingMtx.Lock()
+	defer pub.blockingMtx.Unlock()
+	if ch := pub.blocking[key]; ch != nil {
+		if err != nil {
+			ch <- err
+		}
+		close(ch)
+	}
+}
+
 // Processes confirm messages from the amqp server. If acknowledged, the
 // dispatch is removed from the pending map and the waitgroup is done.
 // If not acknowledged, the dispatch will be retried
@@ -245,18 +305,22 @@ func (pub *PublisherContext) confirmsHandler(
 	for active := true; active; {
 		if cnf, active = <-cnfrms; active {
 			if cnf.DeliveryTag > 0 {
-				if cnf.Ack {
-					pub.clearPending(cnf.DeliveryTag)
-					pub.dispatchWg.Done()
+				dsp, err := pub.getPending(cnf.DeliveryTag)
+				if err != nil {
+					pub.logger.Error(
+						"dispatch is missing",
+						zap.Uint64("seq", cnf.DeliveryTag),
+					)
 				} else {
-					dsp, err := pub.getPending(cnf.DeliveryTag)
-					if err != nil {
-						pub.retryDispatch(dsp)
+					if pub.AfterConfirm != nil {
+						pub.AfterConfirm(dsp, cnf.Ack)
+					}
+					if cnf.Ack {
+						pub.clearPending(cnf.DeliveryTag)
+						pub.dispatchWg.Done()
+						pub.clearBlocking(dsp.Publishing.MessageId, nil)
 					} else {
-						pub.logger.Error(
-							"can not retry dispatch",
-							zap.Uint64("seq", cnf.DeliveryTag),
-						)
+						pub.retryDispatch(dsp)
 						pub.dispatchWg.Done()
 					}
 				}
@@ -274,6 +338,7 @@ func (pub *PublisherContext) returnsHandler(
 	for active := true; active; {
 		if rt, active = <-rtrns; active {
 			pub.logger.Error("publishing returned", zap.Any("dispatch", rt))
+			pub.clearBlocking(rt.MessageId, fmt.Errorf("publishing returned"))
 		}
 	}
 }
@@ -358,6 +423,7 @@ func (pub *PublisherContext) close() {
 		pub.refrCtxCncl()
 		close(pub.dispatchBuff)
 		pub.handlerWg.Wait()
+		pub.processWg.Wait()
 		pub.channelWg.Wait()
 
 		pub.state = Closed
@@ -409,6 +475,7 @@ func (pub *PublisherContext) publish(
 // dispatch channel that will be processed. If the publisher is closed, or the
 // channel is full, the function returns an error
 func (pub *PublisherContext) Dispatch(
+	ctx context.Context,
 	exchange string,
 	routingKey string,
 	mandatory bool,
@@ -430,7 +497,11 @@ func (pub *PublisherContext) Dispatch(
 		routingKey: routingKey,
 		mandatory:  mandatory,
 		immediate:  immediate,
-		publishing: publishing,
+		Publishing: publishing,
+	}
+
+	if pub.BeforePublish != nil {
+		pub.BeforePublish(ctx, &dsp)
 	}
 
 	pub.dispatchWg.Add(1)
@@ -440,5 +511,46 @@ func (pub *PublisherContext) Dispatch(
 	default:
 		pub.dispatchWg.Done()
 		return NewDispatchBufferFullError()
+	}
+}
+
+// Reliable version of the Dispatch function. Blocks until the dispatch is confirmed
+// or rejected. Uses MessageId as key for blocking
+func (pub *PublisherContext) ReliableDispatch(
+	ctx context.Context,
+	exchange string,
+	routingKey string,
+	mandatory bool,
+	immediate bool,
+	publishing amqp.Publishing,
+) error {
+	if publishing.MessageId == "" {
+		pub.logger.Error("missing messageId")
+		return fmt.Errorf("missing messageId")
+	}
+
+	ch, err := pub.setBlocking(publishing.MessageId)
+	if err != nil {
+		pub.logger.Error("failed to block dispatch", zap.Error(err))
+	}
+
+	pub.Dispatch(
+		ctx,
+		exchange,
+		routingKey,
+		mandatory,
+		immediate,
+		publishing,
+	)
+
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("context canceled")
+	case err := <-ch:
+		if err != nil {
+			return err
+		} else {
+			return nil
+		}
 	}
 }
