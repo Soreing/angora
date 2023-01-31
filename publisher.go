@@ -325,9 +325,6 @@ func (pub *PublisherContext) confirmsHandler(
 		select {
 		case cnf, active = <-cnfrms:
 			if active && cnf.DeliveryTag > 0 {
-				if cnf.DeliveryTag%2 == 0 {
-					continue
-				}
 				dsp, err := pub.getPending(cnf.DeliveryTag)
 				if err != nil {
 					pub.logger.Error(
