@@ -2,6 +2,7 @@ package angora
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -95,7 +96,7 @@ func (mgr *ConnectionManager) connect() error {
 }
 
 // Attempts to reconnect to the amqp server. Unlike the connect function,
-// reconnect retries connection untill it is cancelled by the Close function.
+// reconnect retries connection untill it is canceled by the Close function.
 // See Connect for more details.
 func (mgr *ConnectionManager) reconnect() error {
 	mgr.logger.Info("attempting to reconnect")
@@ -120,7 +121,7 @@ func (mgr *ConnectionManager) reconnect() error {
 	)
 	if err != nil {
 		if err.Error() == "context canceled" {
-			mgr.logger.Info("reconnecting cancelled")
+			mgr.logger.Info("reconnecting canceled")
 			return nil
 		} else {
 			mgr.logger.Error("failed to reconnect", zap.Error(err))
@@ -177,7 +178,7 @@ func (mgr *ConnectionManager) closeHandler(
 // requested to close and the manager waits for them to terminate. During
 // this time, the connection is maintained to let resources close gracefullly.
 // Once all resources closed, the connection is closed, and if the
-// manager was currently reconnecting, the reconnection is cancelled.
+// manager was currently reconnecting, the reconnection is canceled.
 // The function waits for the connection to stop, then sets the manager into
 // Closed state before exiting the function.
 func (mgr *ConnectionManager) Close() {
@@ -216,7 +217,7 @@ func (mgr *ConnectionManager) Close() {
 }
 
 // Creates a refresh function that contexts can use to refresh their channel.
-// The channel building keeps retrying untill it succeeds or it's cancelled.
+// The channel building keeps retrying untill it succeeds or it's canceled.
 // While the connection is down, the reconnection pauses.
 func (mgr *ConnectionManager) createRefresh(
 	bldr ChannelBuilder,
@@ -246,7 +247,7 @@ func (mgr *ConnectionManager) createRefresh(
 
 				select {
 				case <-retrCtx.Done():
-					return fmt.Errorf("cancelled refresh function")
+					return errors.New("canceled refresh function")
 				case <-asyncLock:
 					defer mgr.connMtx.RUnlock()
 
@@ -262,7 +263,7 @@ func (mgr *ConnectionManager) createRefresh(
 		)
 		if err != nil {
 			if err.Error() == "context canceled" {
-				lgr.Info("cancelled refresh function")
+				lgr.Info("canceled refresh function")
 			} else {
 				lgr.Error("failed to refresh channel", zap.Error(err))
 			}

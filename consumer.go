@@ -158,7 +158,7 @@ func (cns *ConsumerContext) closeHandler(
 
 			if err := cns.refresh(); err != nil {
 				if err.Error() == "context canceled" {
-					cns.logger.Info("refreshing consumer cancelled")
+					cns.logger.Info("refreshing consumer canceled")
 				} else {
 					cns.logger.Error("failed to refresh", zap.Error(err))
 					panic(fmt.Errorf("failed to refresh: %w", err))
@@ -180,7 +180,7 @@ func (cns *ConsumerContext) refresh() error {
 	chnl, err := cns.refreshFn(cns.refrCtx)
 	if err != nil {
 		if err.Error() == "context canceled" {
-			cns.logger.Info("refreshing channel cancelled")
+			cns.logger.Info("refreshing channel canceled")
 		} else {
 			cns.logger.Error("failed to refresh channel", zap.Error(err))
 		}
