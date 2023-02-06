@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"sync"
-	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 	uuid "github.com/satori/go.uuid"
@@ -13,54 +12,6 @@ import (
 )
 
 const PENDING_ID_TAG = "4bT4ExJH8x"
-
-type Dispatch struct {
-	refId string // Pending reference id
-	seqNo uint64 // sequence number
-
-	retries   int        // Number of retries
-	failed    bool       // Dispatch was returned
-	confirmCh chan error // Notify of confirmation
-
-	startTime  time.Time       // Time of submission
-	exchange   string          // Exchange name
-	routingKey string          // Routing key
-	mandatory  bool            // Mandatory flag
-	immediate  bool            // Immediate flag
-	Publishing amqp.Publishing // Publishing data
-
-	Args map[string]any // Additional details for hooks
-}
-
-func (d *Dispatch) GetRetries() int {
-	return d.retries
-}
-
-func (d *Dispatch) GetStartTime() time.Time {
-	return d.startTime
-}
-
-func (d *Dispatch) GetExchange() string {
-	return d.exchange
-}
-
-func (d *Dispatch) GetRoutingKey() string {
-	return d.routingKey
-}
-
-func (d *Dispatch) IsMandatory() bool {
-	return d.mandatory
-}
-
-func (d *Dispatch) IsImmediate() bool {
-	return d.immediate
-}
-
-func (d *Dispatch) reset() {
-	d.failed = false
-	d.seqNo = 0
-	d.refId = ""
-}
 
 type PublisherOptions struct {
 	Publisher   string // Name of the publisher
@@ -75,36 +26,38 @@ type PublisherContext struct {
 	maxRetr int    // Max retries for dispatches
 
 	channel    *amqp.Channel // AMQP channel object
-	channelMtx *sync.RWMutex // Prevents concurrent access to the channel
-	refreshFn  RefreshFn     // Function used to refresh the channel by the manager
+	channelMtx *sync.RWMutex // Prevents access to the channel when broken
+	refreshFn  RefreshFn     // Function used to refresh a broken channel
 
 	refrCtx     context.Context // Context used for refreshing channels
 	refrCtxCncl func()          // Function to cancel the refresh context
 
-	closeCh  chan error    // Signals the context to close
+	closeCh  chan error    // Used for checking the closed state of the publisher
 	closeMtx *sync.RWMutex // Prevents concurrent calls to Close
 
-	publishTkn   chan bool            // Acquire publishing rights
-	dispatchBuff chan *Dispatch       // Buffers dispatches to be processed
-	dispatchMtx  *sync.RWMutex        // Synchronizes sending dispatches
-	dispatchWg   *sync.WaitGroup      // Total pending dispatches
-	pendSeq      map[uint64]*Dispatch // Map of pending dispatches by sequence num
-	pendRId      map[string]*Dispatch // Map of pending dispatches by reference id
-	pendMtx      sync.Mutex           // Prevents concurrent access to pending maps
-	returnCh     chan amqp.Publishing // Sends failed async publishings back to client
+	retryChan    chan *Dispatch  // Buffers retries to be processed with priority
+	dispatchChan chan *Dispatch  // Buffers dispatches to be processed
+	dispatches   *sync.WaitGroup // Total pending dispatches
+
+	pendSeq map[uint64]*Dispatch // Map of pending dispatches by sequence num
+	pendRId map[string]*Dispatch // Map of pending dispatches by reference id
+	pendMtx sync.Mutex           // Prevents concurrent access to pending maps
+
+	returnCh chan amqp.Publishing // Sends failed async publishings back to client
 
 	channelWg *sync.WaitGroup // Waits for the channel to close
 	handlerWg *sync.WaitGroup // Waits for the handler threads to finish
 	processWg *sync.WaitGroup // Waits for the dispatch processor to finish
 
-	BeforePublish func(context.Context, *Dispatch) // Hook executing code before publishing a dispatch
-	AfterConfirm  func(Dispatch, bool)             // Hook executing after confirming a dispatch
+	onDispatch []func(context.Context, *Dispatch) // Hooks ran before queueing a dispatch
+	onPublish  []func(*Dispatch)                  // Hooks ran before publishing a dispatch
+	onConfirm  []func(*Dispatch, bool)            // Hooks ran after publishings are acked or nacked
 
 	logger *zap.Logger
 }
 
-// Creates a new channel context, starts processing dispatches, then
-// initializes handlers and fills the publish token channel with 1 token
+// Creates a new channel context, starts processing dispatches,
+// then initializes handlers
 func newPublisherContext(
 	id string,
 	options PublisherOptions,
@@ -133,16 +86,17 @@ func newPublisherContext(
 		closeCh:  make(chan error),
 		closeMtx: &sync.RWMutex{},
 
-		publishTkn:   make(chan bool, 1),
-		dispatchBuff: make(chan *Dispatch, options.BufferSize),
-		dispatchMtx:  &sync.RWMutex{},
-		dispatchWg:   &sync.WaitGroup{},
-		pendSeq:      map[uint64]*Dispatch{},
-		pendRId:      map[string]*Dispatch{},
-		pendMtx:      sync.Mutex{},
-		channelWg:    &sync.WaitGroup{},
-		handlerWg:    &sync.WaitGroup{},
-		processWg:    &sync.WaitGroup{},
+		retryChan:    make(chan *Dispatch, options.BufferSize),
+		dispatchChan: make(chan *Dispatch, options.BufferSize),
+		dispatches:   &sync.WaitGroup{},
+
+		pendSeq: map[uint64]*Dispatch{},
+		pendRId: map[string]*Dispatch{},
+		pendMtx: sync.Mutex{},
+
+		channelWg: &sync.WaitGroup{},
+		handlerWg: &sync.WaitGroup{},
+		processWg: &sync.WaitGroup{},
 
 		logger: lgr,
 	}
@@ -159,7 +113,6 @@ func newPublisherContext(
 		pub.dispatchProcessor()
 	}()
 
-	pub.publishTkn <- true
 	pub.initialize()
 	return pub, nil
 }
@@ -199,10 +152,20 @@ func (pub *PublisherContext) initialize() {
 func (pub *PublisherContext) dispatchProcessor() {
 	var dsp *Dispatch
 	for active := true; active; {
-		if dsp, active = <-pub.dispatchBuff; active {
-			err := pub.publishLocked(dsp)
-			if err != nil {
-				pub.retryDispatch(dsp)
+		select {
+		case dsp, active = <-pub.retryChan:
+			/* successfully read from retry channel */
+		default:
+			select {
+			case dsp, active = <-pub.retryChan:
+				/* successfully read from retry channel */
+			case dsp, active = <-pub.dispatchChan:
+				/* successfully read from dispatch channel*/
+			}
+		}
+		if active {
+			if err := pub.publish(dsp); err != nil {
+				pub.retryDispatch(dsp, pub.retryChan)
 			}
 		}
 	}
@@ -210,14 +173,23 @@ func (pub *PublisherContext) dispatchProcessor() {
 
 // Retries the dispatch if it is below the maximum retries threshold. If the
 // dispatch can not be retried, it is returned to the client
-func (pub *PublisherContext) retryDispatch(dsp *Dispatch) {
+func (pub *PublisherContext) retryDispatch(dsp *Dispatch, dest chan *Dispatch) {
 	dsp.retries++
 	dsp.reset()
 
-	if dsp.retries < pub.maxRetr {
-		pub.dispatchBuff <- dsp
+	var err error
+	if dsp.retries <= pub.maxRetr {
+		select {
+		case dest <- dsp:
+			/* successfully pushed to the destination */
+		default:
+			err = errors.New("destination channel is full")
+		}
 	} else {
-		err := errors.New("failed after max retries")
+		err = errors.New("failed after max retries")
+	}
+
+	if err != nil {
 		pub.logger.Error(
 			"failed to retry dispatch",
 			zap.Any("dispatch", dsp),
@@ -228,7 +200,7 @@ func (pub *PublisherContext) retryDispatch(dsp *Dispatch) {
 		} else if pub.returnCh != nil {
 			pub.returnCh <- dsp.Publishing
 		}
-		pub.dispatchWg.Done()
+		pub.dispatches.Done()
 	}
 }
 
@@ -278,7 +250,7 @@ func (pub *PublisherContext) failPending(rid string) error {
 	pub.pendMtx.Lock()
 	defer pub.pendMtx.Unlock()
 	if dsp := pub.pendRId[rid]; dsp != nil {
-		dsp.failed = true
+		dsp.returned = true
 		return nil
 	} else {
 		err := errors.New("dispatch not found")
@@ -311,9 +283,9 @@ func (pub *PublisherContext) clearPending(seq uint64) error {
 }
 
 // Processes confirm and return messages from the amqp server. If the publishing
-// was returned, is marked as such in the pending map. Upon confirmation, if
-// the publishing is acknowledged and not returned, it is removed from the pending
-// map. Otherwise, the publishing is retried.
+// was returned, is marked as such in the pending map. Upon confirmation, the
+// confirm hooks are ran, and  if the publishing was successful, it is removed
+// from the pending map. Otherwise, the publishing is retried.
 func (pub *PublisherContext) confirmsHandler(
 	cnfrms <-chan amqp.Confirmation,
 	rtrns <-chan amqp.Return,
@@ -325,6 +297,10 @@ func (pub *PublisherContext) confirmsHandler(
 		select {
 		case cnf, active = <-cnfrms:
 			if active && cnf.DeliveryTag > 0 {
+				if cnf.DeliveryTag%2 == 0 {
+					continue
+				}
+
 				dsp, err := pub.getPending(cnf.DeliveryTag)
 				if err != nil {
 					pub.logger.Error(
@@ -333,18 +309,18 @@ func (pub *PublisherContext) confirmsHandler(
 						zap.Error(err),
 					)
 				} else {
-					ok := cnf.Ack && !dsp.failed
-					if pub.AfterConfirm != nil {
-						pub.AfterConfirm(*dsp, ok)
+					ok := cnf.Ack && !dsp.returned
+					for _, hk := range pub.onConfirm {
+						hk(dsp, ok)
 					}
 					if ok {
 						pub.clearPending(cnf.DeliveryTag)
-						pub.dispatchWg.Done()
+						pub.dispatches.Done()
 						if dsp.confirmCh != nil {
 							close(dsp.confirmCh)
 						}
 					} else {
-						pub.retryDispatch(dsp)
+						pub.retryDispatch(dsp, pub.dispatchChan)
 					}
 				}
 			}
@@ -396,8 +372,7 @@ func (pub *PublisherContext) closeHandler(
 
 // Refreshes the channel by calling the refresh function. Puts a lock on the
 // channel to stop other functions using it while it is stale. Once refreshed,
-// the handlers are set up and pending publishings are re-sent. If the pending
-// publishings fail to be re-sent, the channel is closed to try again.
+// the handlers are set up and pending publishings are retried.
 func (pub *PublisherContext) refresh() error {
 	pub.logger.Info("attempting to refresh publisher context")
 	pub.channelMtx.Lock()
@@ -416,93 +391,68 @@ func (pub *PublisherContext) refresh() error {
 
 	pub.channel = chnl
 	pub.initialize()
-
-	if err = pub.republishPending(); err != nil {
-		pub.logger.Warn("failed to retry pending publishings")
-	}
+	pub.requeuePending()
 
 	pub.logger.Info("publisher context refreshed")
 	return nil
 }
 
-// Re-publishes all pending dispatches to receive confirmation.
-func (pub *PublisherContext) republishPending() error {
-	pub.logger.Info("retrying pending publishings")
+// Requeues the pending messages that are unable to receive a confirmation.
+func (pub *PublisherContext) requeuePending() error {
+	pub.logger.Info("requeuing pending publishings")
 
-	stale, idx := make([]*Dispatch, len(pub.pendRId)), 0
 	for _, e := range pub.pendRId {
-		stale[idx] = e
-		idx++
-		fmt.Println(e.seqNo)
+		for _, hk := range pub.onConfirm {
+			hk(e, false)
+		}
+		pub.retryDispatch(e, pub.retryChan)
 	}
+
 	pub.pendRId = map[string]*Dispatch{}
 	pub.pendSeq = map[uint64]*Dispatch{}
-
-	for _, e := range stale {
-		if err := pub.publish(e); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
-// Publishes a dispatch with a read lock on the channel.
-func (pub *PublisherContext) publishLocked(
+// Publish a dispatch with a sequence and reference id. The publish hooks
+// are ran and the dispatch is set as pending. On failure to publish,
+// the dispatch is cleared from pending
+func (pub *PublisherContext) publish(
 	dsp *Dispatch,
 ) error {
 	pub.channelMtx.RLock()
 	defer pub.channelMtx.RUnlock()
-	return pub.publish(dsp)
-}
 
-// Publishes a dispatch. A reference id is generated for setting the dispatch as
-// pending. On failure to publish, the pending record is cleared.
-func (pub *PublisherContext) publish(
-	dsp *Dispatch,
-) error {
-	select {
-	case <-pub.closeCh:
-		err := NewContextClosedError()
+	if dsp.Publishing.Headers == nil {
+		dsp.Publishing.Headers = amqp.Table{}
+	}
+
+	dsp.refId = uuid.NewV4().String()
+	dsp.seqNo = pub.channel.GetNextPublishSeqNo()
+	dsp.Publishing.Headers[PENDING_ID_TAG] = dsp.refId
+
+	pub.setPending(dsp)
+	for _, hk := range pub.onPublish {
+		hk(dsp)
+	}
+
+	err := pub.channel.PublishWithContext(
+		context.TODO(),
+		dsp.exchange,
+		dsp.routingKey,
+		dsp.mandatory,
+		dsp.immediate,
+		dsp.Publishing,
+	)
+	if err != nil {
+		pub.clearPending(dsp.seqNo)
 		pub.logger.Error("failed to publish", zap.Error(err))
 		return err
-	default:
-		if dsp.Publishing.Headers == nil {
-			dsp.Publishing.Headers = amqp.Table{}
-		}
-
-		rid := uuid.NewV4().String()
-		dsp.Publishing.Headers[PENDING_ID_TAG] = rid
-		dsp.refId = rid
-
-		// Publisher Token Scheme
-		<-pub.publishTkn
-		defer func() {
-			pub.publishTkn <- true
-		}()
-
-		sqno := pub.channel.GetNextPublishSeqNo()
-		dsp.seqNo = sqno
-
-		pub.setPending(dsp)
-		err := pub.channel.PublishWithContext(
-			context.TODO(),
-			dsp.exchange,
-			dsp.routingKey,
-			dsp.mandatory,
-			dsp.immediate,
-			dsp.Publishing,
-		)
-		if err != nil {
-			pub.clearPending(sqno)
-			pub.logger.Error("failed to publish", zap.Error(err))
-			return err
-		}
-		return nil
 	}
+	return nil
 }
 
-// Signals the publisher context to close. The function will wait for the dispatches
-// to finish before closing the channel and cancelling refresh to stop gracefully.
+// Closes the publisher context and waits for all pending dispatches before
+// closing the underlying channel and processes gracefully.
 func (pub *PublisherContext) close() {
 	pub.logger.Info("attempting to close publisher context")
 	pub.closeMtx.Lock()
@@ -516,12 +466,15 @@ func (pub *PublisherContext) close() {
 		close(pub.closeCh)
 
 		pub.logger.Info("waiting for pending dispatches")
-		pub.dispatchWg.Wait()
+		pub.dispatches.Wait()
+		close(pub.dispatchChan)
+		close(pub.retryChan)
 
-		close(pub.dispatchBuff)
+		pub.logger.Info("closing amqp channel")
 		pub.channel.Close()
 		pub.refrCtxCncl()
 
+		pub.logger.Info("waiting for processes to stop")
 		pub.handlerWg.Wait()
 		pub.processWg.Wait()
 
@@ -529,106 +482,143 @@ func (pub *PublisherContext) close() {
 	}
 }
 
-// Push a dispatch with specified exchange, routing key and json body into the
-// dispatch channel that will be processed. If the publisher is closed, or the
-// channel is full, the function returns an error. Publishing is done async. If
-// The publishing fails, it is returned via the return channel.
+// Dispatch a publishing to an exchange with a routing key and options.
+// The dispatch hooks are ran and the dispatch is pushed to a buffered channel.
+// If the dispatch buffer is full, the function waits until there is space, or
+// until the context is canceled. Processing the dispatch is asynchronous.
 func (pub *PublisherContext) DispatchAsync(
 	ctx context.Context,
 	exchange, routingKey string,
 	mandatory, immediate bool,
 	publishing amqp.Publishing,
-) error {
-	pub.dispatchMtx.RLock()
-	defer pub.dispatchMtx.RUnlock()
+) (err error) {
+	dsp := &Dispatch{
+		retries:    0,
+		returned:   false,
+		exchange:   exchange,
+		routingKey: routingKey,
+		mandatory:  mandatory,
+		immediate:  immediate,
+		Publishing: publishing,
+		Params:     map[string]any{},
+	}
 
 	select {
 	case <-pub.closeCh:
-		err := NewContextClosedError()
-		pub.logger.Error("failed to dispatch", zap.Error(err))
-		return err
+		err = errors.New("publisher closed")
 	default:
-		dsp := &Dispatch{
-			retries:    0,
-			failed:     false,
-			startTime:  time.Now(),
-			exchange:   exchange,
-			routingKey: routingKey,
-			mandatory:  mandatory,
-			immediate:  immediate,
-			Publishing: publishing,
-			Args:       map[string]any{},
+		pub.dispatches.Add(1)
+		for _, hk := range pub.onDispatch {
+			hk(ctx, dsp)
 		}
 
-		if pub.BeforePublish != nil {
-			pub.BeforePublish(ctx, dsp)
-		}
-
-		pub.dispatchWg.Add(1)
 		select {
-		case pub.dispatchBuff <- dsp:
-			return nil
-		default:
-			pub.dispatchWg.Done()
-			err := NewDispatchBufferFullError()
-			pub.logger.Error("failed to dispatch", zap.Error(err))
-			return err
+		case <-ctx.Done():
+			err = errors.New("context canceled")
+		case pub.dispatchChan <- dsp:
+			/* successfully dispatched */
 		}
 	}
+
+	if err != nil {
+		pub.logger.Error(
+			"failed to dispatch",
+			zap.Any("dispatch", *dsp),
+			zap.Error(err),
+		)
+	}
+	return
 }
 
-// Push a dispatch with specified exchange, routing key and json body into the
-// dispatch channel that will be processed. If the publisher is closed, or the
-// channel is full, the function returns an error. Waits for the publishing
-// to be confirmed or fail and return.
+// Dispatch a publishing to an exchange with a routing key and options.
+// The dispatch hooks are ran and the dispatch is pushed to a buffered channel.
+// Waits untill the dispatch is confirmed or fails, or the context is canceled.
 func (pub *PublisherContext) Dispatch(
 	ctx context.Context,
 	exchange, routingKey string,
 	mandatory, immediate bool,
 	publishing amqp.Publishing,
-) error {
-	pub.dispatchMtx.RLock()
-	defer pub.dispatchMtx.RUnlock()
+) (err error) {
+	confirmCh := make(chan error)
+	dsp := &Dispatch{
+		retries:    0,
+		returned:   false,
+		confirmCh:  confirmCh,
+		exchange:   exchange,
+		routingKey: routingKey,
+		mandatory:  mandatory,
+		immediate:  immediate,
+		Publishing: publishing,
+		Params:     map[string]any{},
+	}
 
 	select {
 	case <-pub.closeCh:
-		err := NewContextClosedError()
-		pub.logger.Error("failed to dispatch", zap.Error(err))
-		return err
+		err = errors.New("publisher closed")
 	default:
-		confirmCh := make(chan error)
-		dsp := &Dispatch{
-			retries:    0,
-			failed:     false,
-			startTime:  time.Now(),
-			confirmCh:  confirmCh,
-			exchange:   exchange,
-			routingKey: routingKey,
-			mandatory:  mandatory,
-			immediate:  immediate,
-			Publishing: publishing,
+		pub.dispatches.Add(1)
+		for _, hk := range pub.onDispatch {
+			hk(ctx, dsp)
 		}
 
-		if pub.BeforePublish != nil {
-			pub.BeforePublish(ctx, dsp)
-		}
-
-		pub.dispatchWg.Add(1)
 		select {
 		case <-ctx.Done():
-			return errors.New("context canceled")
-		case pub.dispatchBuff <- dsp:
+			err = errors.New("context canceled")
+		case pub.dispatchChan <- dsp:
 			select {
 			case <-ctx.Done():
-				return errors.New("context canceled")
-			case err := <-confirmCh:
-				return err
+				err = errors.New("context canceled")
+			case err = <-confirmCh:
+				/*err = nil in case of success*/
 			}
+
+			if err != nil {
+				pub.logger.Error(
+					"dispatch failed",
+					zap.Any("dispatch", *dsp),
+					zap.Error(err),
+				)
+			}
+			return
 		}
 	}
+
+	if err != nil {
+		pub.logger.Error(
+			"failed to dispatch",
+			zap.Any("dispatch", *dsp),
+			zap.Error(err),
+		)
+	}
+	return
 }
 
-// Returns a channel that sends async publishings that failed to publish
+// Attaches a dispatch hook on the publisher that is executed before
+// the dispatch gets queued in the channel. The hook can not be removed.
+func (pub *PublisherContext) UseDispatchHook(
+	fn func(context.Context, *Dispatch),
+) {
+	pub.onDispatch = append(pub.onDispatch, fn)
+}
+
+// Attaches a publish hook on the publisher that is executed before
+// the dispatch gets published. The hook can not be removed.
+func (pub *PublisherContext) UsePublishHook(
+	fn func(*Dispatch),
+) {
+	pub.onPublish = append(pub.onPublish, fn)
+}
+
+// Attaches a confrim hook on the publisher that is executed when the
+// dispatch receives an ack or a nack from the server. The hook can
+// not be removed.
+func (pub *PublisherContext) UseConfirmHook(
+	fn func(*Dispatch, bool),
+) {
+	pub.onConfirm = append(pub.onConfirm, fn)
+}
+
+// Returns a channel containing async publishings that failed to publish
 func (pub *PublisherContext) Returns() chan amqp.Publishing {
 	return pub.returnCh
 }
